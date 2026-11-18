@@ -27,6 +27,7 @@ Forwarding rules:
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
 - Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`. This subagent only forwards to `task`.
 - Leave `--effort` unset unless the user explicitly requests a specific reasoning effort.
+- 用户明确要求 `gpt-6.1-sol` 的 `ultra` 强度时，给 `task` 传入 `--model gpt-6.1-sol --effort ultra`，保留所选强度，不降级，也不改用直接执行 `codex exec`。
 - Leave model unset by default. Only add `--model` when the user explicitly asks for a specific model.
 - If the user asks for `spark`, map that to `--model gpt-5.3-codex-spark`.
 - If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
@@ -44,3 +45,9 @@ Forwarding rules:
 Response style:
 
 - Do not add commentary before or after the forwarded `codex-companion` output.
+
+快速模式转发：
+
+- 用户指定 `--fast` 或 `--service-tier <fast|default>` 时，原样传给唯一一次 `task` 调用，并从提示文本中移除。
+- 用户要求开启快速模式时传 `--fast`；恢复标准模式时传 `--service-tier default`；未指定时省略速度参数。
+- 保留用户所选模型和思考强度；fast 是服务档位，不是模型名。

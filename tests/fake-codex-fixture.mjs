@@ -25,7 +25,8 @@ const readline = require("node:readline");
 	}
 
 function saveState(state) {
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+  fs.writeFileSync(STATE_PATH + "." + process.pid + ".tmp", JSON.stringify(state, null, 2));
+  fs.renameSync(STATE_PATH + "." + process.pid + ".tmp", STATE_PATH);
 }
 
 function requiresExperimental(field, message, state) {
@@ -123,6 +124,7 @@ function nextThread(state, cwd, ephemeral) {
     name: null,
     preview: "",
     ephemeral: Boolean(ephemeral),
+    writerPid: process.pid,
     createdAt: now(),
     updatedAt: now()
   };
@@ -313,7 +315,10 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        thread.serviceTier = message.params.serviceTier ?? "default";
+        state.lastThreadStart = message.params;
+        saveState(state);
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: thread.serviceTier, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -345,9 +350,64 @@ rl.on("line", (line) => {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
         const thread = ensureThread(state, message.params.threadId);
+        if (thread.writerPid && thread.writerPid !== process.pid) {
+          let writerActive = false;
+          try { process.kill(thread.writerPid, 0); writerActive = true; } catch {}
+          if (writerActive) {
+            throw new Error("thread " + thread.id + " already has an active writer");
+          }
+        }
+        thread.writerPid = process.pid;
         thread.updatedAt = now();
+        if (message.params.serviceTier != null) {
+          thread.serviceTier = message.params.serviceTier;
+        }
+        state.lastThreadResume = message.params;
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: BEHAVIOR === "stale-resume-tier" ? "default" : thread.serviceTier ?? null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        break;
+      }
+
+      case "thread/settings/update": {
+        if (BEHAVIOR === "speed-reject") {
+          throw new Error("service tier is not allowed for this account");
+        }
+        const thread = ensureThread(state, message.params.threadId);
+        thread.serviceTier = message.params.serviceTier;
+        state.lastThreadSettings = message.params;
+        saveState(state);
+        const pendingEntry = [...interruptibleTurns.entries()].find(([, value]) => value.threadId === thread.id);
+        if (pendingEntry) {
+          const [turnId, pending] = pendingEntry;
+          send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "during_speed", text: "速度切换期间的进度消息", phase: "analysis" } } });
+          if (BEHAVIOR === "speed-finished") {
+            clearTimeout(pending.timer);
+            interruptibleTurns.delete(turnId);
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          }
+        }
+        send({ id: message.id, result: {} });
+        break;
+      }
+
+      case "turn/settings/update": {
+        if (!args.includes("--enable") || !args.includes("step_model_switching")) {
+          throw new Error("turn settings updates require the step_model_switching feature");
+        }
+        if (!state.capabilities?.experimentalApi) {
+          throw new Error("turn/settings/update requires experimentalApi capability");
+        }
+        if (BEHAVIOR === "speed-partial") {
+          throw new Error("running turn settings rejected");
+        }
+        const pending = interruptibleTurns.get(message.params.turnId);
+        const applied = pending?.threadId === message.params.threadId;
+        state.lastTurnSettings = message.params;
+        if (applied) {
+          state.activeServiceTier = message.params.serviceTier;
+        }
+        saveState(state);
+        send({ id: message.id, result: { status: applied ? "applied" : "targetUnavailable" } });
         break;
       }
 
@@ -449,8 +509,10 @@ rl.on("line", (line) => {
 	          turnId,
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
+	          ...(Object.prototype.hasOwnProperty.call(message.params, "serviceTier") ? { serviceTier: message.params.serviceTier } : {}),
 	          prompt
 	        };
+        state.turnStartCount = (state.turnStartCount || 0) + 1;
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
@@ -585,7 +647,7 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (BEHAVIOR === "interruptible-slow-task" || BEHAVIOR.startsWith("speed-")) {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
@@ -598,7 +660,7 @@ rl.on("line", (line) => {
 	              }
 	            }
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
-	          }, 5000);
+	          }, BEHAVIOR.startsWith("speed-") ? 2500 : 5000);
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
 	        } else if (BEHAVIOR === "slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);

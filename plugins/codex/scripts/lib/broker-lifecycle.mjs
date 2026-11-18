@@ -56,9 +56,9 @@ export async function sendBrokerShutdown(endpoint) {
   });
 }
 
-export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
+export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env, isolated = false }) {
   const logFd = fs.openSync(logFile, "a");
-  const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
+  const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile, ...(isolated ? ["--single-task"] : [])], {
     cwd,
     env,
     detached: true,
@@ -111,7 +111,7 @@ async function isBrokerEndpointReady(endpoint) {
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
-  const existing = loadBrokerSession(cwd);
+  const existing = options.isolated ? null : loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;
   }
@@ -143,7 +143,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
     endpoint,
     pidFile,
     logFile,
-    env: options.env ?? process.env
+    env: options.env ?? process.env,
+    isolated: Boolean(options.isolated)
   });
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
@@ -166,7 +167,9 @@ export async function ensureBrokerSession(cwd, options = {}) {
     sessionDir,
     pid: child.pid ?? null
   };
-  saveBrokerSession(cwd, session);
+  if (!options.isolated) {
+    saveBrokerSession(cwd, session);
+  }
   return session;
 }
 

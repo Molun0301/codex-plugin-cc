@@ -8,8 +8,11 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { clearBrokerSession, loadBrokerSession, teardownBrokerSession } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+// 没有客户端连接、也没有运行中的轮次时，空闲满该时长后自行退出。
+const IDLE_TIMEOUT_MS = Number(process.env.CODEX_COMPANION_BROKER_IDLE_MS) || 15 * 60 * 1000;
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -33,8 +36,12 @@ function send(socket, message) {
   socket.write(`${JSON.stringify(message)}\n`);
 }
 
-function isInterruptRequest(message) {
-  return message?.method === "turn/interrupt";
+function isControlRequest(message, threadIds) {
+  if (message?.method === "turn/interrupt") {
+    return true;
+  }
+  return ["thread/settings/update", "turn/settings/update"].includes(message?.method) &&
+    threadIds?.has(message.params?.threadId);
 }
 
 function writePidFile(pidFile) {
@@ -52,7 +59,8 @@ async function main() {
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "endpoint"],
+    booleanOptions: ["single-task"]
   });
 
   if (!options.endpoint) {
@@ -69,7 +77,32 @@ async function main() {
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let primarySocket = null;
+  let shuttingDown = false;
   const sockets = new Set();
+  // 客户端被杀后轮次可能仍在运行，按线程记录，避免空闲退出中断 Codex 的工作。
+  const runningTurnThreadIds = new Set();
+  let idleTimer = null;
+
+  function refreshIdleTimer() {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+    if (shuttingDown || sockets.size > 0 || runningTurnThreadIds.size > 0) {
+      return;
+    }
+    idleTimer = setTimeout(shutdownWhenIdle, IDLE_TIMEOUT_MS);
+  }
+
+  async function shutdownWhenIdle() {
+    await shutdown(server);
+    // 与 SessionEnd 的清理结果保持一致；独立 broker 不写 broker.json，由调用方回收。
+    const session = loadBrokerSession(cwd);
+    if (session?.endpoint === endpoint) {
+      teardownBrokerSession(session);
+      clearBrokerSession(cwd);
+    }
+    process.exit(0);
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -82,6 +115,13 @@ async function main() {
   }
 
   function routeNotification(message) {
+    if (message.method === "turn/started") {
+      runningTurnThreadIds.add(message.params?.threadId);
+      refreshIdleTimer();
+    } else if (message.method === "turn/completed") {
+      runningTurnThreadIds.delete(message.params?.threadId);
+      refreshIdleTimer();
+    }
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
@@ -100,11 +140,18 @@ async function main() {
   }
 
   async function shutdown(server) {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    clearTimeout(idleTimer);
+    // 先停止接收新连接，新调用的就绪探测失败后会另起 broker。
+    const serverClosed = new Promise((resolve) => server.close(resolve));
     for (const socket of sockets) {
       socket.end();
     }
     await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
+    await serverClosed;
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
     }
@@ -117,6 +164,7 @@ async function main() {
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
+    refreshIdleTimer();
     socket.setEncoding("utf8");
     let buffer = "";
 
@@ -167,12 +215,12 @@ async function main() {
           continue;
         }
 
-        const allowInterruptDuringActiveStream =
-          isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
+        const allowControlDuringActiveStream =
+          isControlRequest(message, activeStreamThreadIds) && activeStreamSocket && !activeRequestSocket;
 
         if (
           ((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
-          !allowInterruptDuringActiveStream
+          !allowControlDuringActiveStream
         ) {
           send(socket, {
             id: message.id,
@@ -181,7 +229,8 @@ async function main() {
           continue;
         }
 
-        if (allowInterruptDuringActiveStream) {
+        if (allowControlDuringActiveStream) {
+          // 控制请求复用连接，但不得接管原任务的通知流或清除其所有权。
           try {
             const result = await appClient.request(message.method, message.params ?? {});
             send(socket, { id: message.id, result });
@@ -201,6 +250,7 @@ async function main() {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
           if (isStreaming) {
+            primarySocket ??= socket;
             activeStreamSocket = socket;
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
           }
@@ -225,13 +275,23 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      if (options["single-task"] && primarySocket === socket && !shuttingDown) {
+        // 独立任务完成或被取消后，其控制连接一并回收。
+        awaitShutdown();
+      }
+      refreshIdleTimer();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      refreshIdleTimer();
     });
   });
+
+  function awaitShutdown() {
+    shutdown(server).finally(() => process.exit(0));
+  }
 
   process.on("SIGTERM", async () => {
     await shutdown(server);
@@ -244,6 +304,7 @@ async function main() {
   });
 
   server.listen(listenTarget.path);
+  refreshIdleTimer();
 }
 
 main().catch((error) => {

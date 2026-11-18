@@ -12,6 +12,33 @@ const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
 
+function writeJsonAtomically(file, value) {
+  const temporary = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    fs.renameSync(temporary, file);
+  } finally {
+    if (fs.existsSync(temporary)) {
+      fs.unlinkSync(temporary);
+    }
+  }
+}
+
+function withJobSpeed(jobFile, job) {
+  const speedFile = jobFile.replace(/\.json$/, ".speed.json");
+  if (!fs.existsSync(speedFile)) {
+    return job;
+  }
+  const speed = JSON.parse(fs.readFileSync(speedFile, "utf8"));
+  return { ...job, serviceTier: speed.serviceTier, speedUpdate: speed };
+}
+
+export function writeJobSpeed(cwd, jobId, speed) {
+  // 切换结果单独落盘，避免与工作进程的进度及完成记录相互覆盖。
+  const file = resolveJobFile(cwd, jobId).replace(/\.json$/, ".speed.json");
+  writeJsonAtomically(file, speed);
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -111,7 +138,7 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeJsonAtomically(resolveStateFile(cwd), nextState);
   return nextState;
 }
 
@@ -147,7 +174,7 @@ export function upsertJob(cwd, jobPatch) {
 }
 
 export function listJobs(cwd) {
-  return loadState(cwd).jobs;
+  return loadState(cwd).jobs.map((job) => withJobSpeed(resolveJobFile(cwd, job.id), job));
 }
 
 export function setConfig(cwd, key, value) {
@@ -166,18 +193,19 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeJsonAtomically(jobFile, withJobSpeed(jobFile, payload));
   return jobFile;
 }
 
 export function readJobFile(jobFile) {
-  return JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  return withJobSpeed(jobFile, JSON.parse(fs.readFileSync(jobFile, "utf8")));
 }
 
 function removeJobFile(jobFile) {
   if (fs.existsSync(jobFile)) {
     fs.unlinkSync(jobFile);
   }
+  removeFileIfExists(jobFile.replace(/\.json$/, ".speed.json"));
 }
 
 export function resolveJobLogFile(cwd, jobId) {

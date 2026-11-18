@@ -18,7 +18,10 @@ function normalizeProgressEvent(value) {
       turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
-      logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
+      logBody: value.logBody == null ? null : String(value.logBody).trimEnd(),
+      ...Object.fromEntries(["serviceTier", "runtimeTransport", "runtimeEndpoint"]
+        .filter((key) => Object.prototype.hasOwnProperty.call(value, key))
+        .map((key) => [key, value[key]]))
     };
   }
 
@@ -76,6 +79,13 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     const normalized = normalizeProgressEvent(event);
     const patch = { id: jobId };
     let changed = false;
+
+    for (const key of ["serviceTier", "runtimeTransport", "runtimeEndpoint"]) {
+      if (Object.prototype.hasOwnProperty.call(normalized, key)) {
+        patch[key] = normalized[key];
+        changed = true;
+      }
+    }
 
     if (normalized.phase && normalized.phase !== lastPhase) {
       lastPhase = normalized.phase;

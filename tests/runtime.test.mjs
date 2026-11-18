@@ -784,6 +784,42 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
+test("task 将 gpt-6.1-sol 的 ultra 强度传到应用服务并支持继续同一会话", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+
+  const first = run("node", [SCRIPT, "task", '--fresh --model gpt-6.1-sol --effort ultra "检查参数传递"'], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+  const initialState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(initialState.lastTurnStart.model, "gpt-6.1-sol");
+  assert.equal(initialState.lastTurnStart.effort, "ultra");
+  assert.equal(initialState.lastTurnStart.prompt, "检查参数传递");
+
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "--model", "gpt-6.1-sol", "--effort", "ULTRA", "继续检查"], { cwd: repo, env });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const resumedState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(resumedState.lastTurnStart.threadId, initialState.lastTurnStart.threadId);
+  assert.equal(resumedState.lastTurnStart.model, "gpt-6.1-sol");
+  assert.equal(resumedState.lastTurnStart.effort, "ultra");
+  assert.equal(resumedState.lastTurnStart.prompt, "继续检查");
+});
+
+test("task 拒绝未知推理强度且不启动 Codex 或保存任务", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const result = run("node", [SCRIPT, "task", "--model", "gpt-6.1-sol", "--effort", "ultraa", "检查拒绝路径"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Unsupported reasoning effort "ultraa"/);
+  assert.equal(fs.existsSync(path.join(binDir, "fake-codex-state.json")), false);
+  assert.equal(fs.existsSync(resolveStateDir(repo)), false);
+});
+
 test("task logs reasoning summaries and assistant messages to the job log", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1143,7 +1179,7 @@ test("status shows phases, hints, and the latest finished job", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Active jobs:/);
-  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Actions \|/);
+  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| 服务档位 \| Elapsed \| Codex Session ID \| Summary \| Actions \|/);
   assert.match(result.stdout, /\| review-live \| review \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/);
   assert.match(result.stdout, /`\/codex:status review-live`<br>`\/codex:cancel review-live`/);
   assert.match(result.stdout, /Live details:/);

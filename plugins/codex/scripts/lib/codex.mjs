@@ -41,8 +41,9 @@ import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
-import { loadBrokerSession } from "./broker-lifecycle.mjs";
+import { ensureBrokerSession, loadBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
+import { displayServiceTier } from "./service-tier.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
@@ -64,6 +65,7 @@ function buildThreadParams(cwd, options = {}) {
   return {
     cwd,
     model: options.model ?? null,
+    ...(options.serviceTier == null ? {} : { serviceTier: options.serviceTier }),
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
     serviceName: SERVICE_NAME,
@@ -77,6 +79,7 @@ function buildResumeParams(threadId, cwd, options = {}) {
     threadId,
     cwd,
     model: options.model ?? null,
+    ...(options.serviceTier == null ? {} : { serviceTier: options.serviceTier }),
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only"
   };
@@ -610,10 +613,13 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   }
 }
 
-async function withAppServer(cwd, fn) {
+async function withAppServer(cwd, fn, options = {}) {
   let client = null;
   try {
     client = await CodexAppServerClient.connect(cwd);
+    if (options.controlFallback && client.transport !== "broker") {
+      throw new Error("Could not start a controllable Codex runtime. Retry after checking the shared runtime.");
+    }
     const result = await fn(client);
     await client.close();
     return result;
@@ -630,6 +636,22 @@ async function withAppServer(cwd, fn) {
 
     if (!shouldRetryDirect) {
       throw error;
+    }
+
+    if (options.controlFallback) {
+      const session = await ensureBrokerSession(cwd, { isolated: true });
+      if (!session) {
+        throw new Error("Could not start a controllable Codex runtime for this parallel task.");
+      }
+      let isolatedClient = null;
+      try {
+        isolatedClient = await CodexAppServerClient.connect(cwd, { brokerEndpoint: session.endpoint });
+        return await fn(isolatedClient);
+      } finally {
+        await isolatedClient?.close().catch(() => {});
+        await sendBrokerShutdown(session.endpoint);
+        teardownBrokerSession(session);
+      }
     }
 
     const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
@@ -957,7 +979,7 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   }
 }
 
-export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
+export async function interruptAppServerTurn(cwd, { threadId, turnId, runtimeEndpoint = null }) {
   if (!threadId || !turnId) {
     return {
       attempted: false,
@@ -979,7 +1001,10 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
 
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
+    client = await CodexAppServerClient.connect(cwd, {
+      reuseExistingBroker: true,
+      ...(runtimeEndpoint ? { brokerEndpoint: runtimeEndpoint } : {})
+    });
     await client.request("turn/interrupt", { threadId, turnId });
     return {
       attempted: true,
@@ -1100,28 +1125,36 @@ export async function runAppServerTurn(cwd, options = {}) {
 
   return withAppServer(cwd, async (client) => {
     let threadId;
+    let serviceTier = options.serviceTier ?? null;
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       const response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
+        serviceTier: options.serviceTier,
         sandbox: options.sandbox,
         ephemeral: false
       });
       threadId = response.thread.id;
+      serviceTier = displayServiceTier(options.serviceTier ?? response.serviceTier ?? serviceTier);
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       const response = await startThread(client, cwd, {
         model: options.model,
+        serviceTier: options.serviceTier,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
       threadId = response.thread.id;
+      serviceTier = displayServiceTier(options.serviceTier ?? response.serviceTier ?? serviceTier);
     }
 
     emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
-      threadId
+      threadId,
+      serviceTier,
+      runtimeTransport: client.transport,
+      runtimeEndpoint: client.options.brokerEndpoint ?? null
     });
 
     const prompt = options.prompt?.trim() || options.defaultPrompt || "";
@@ -1137,6 +1170,7 @@ export async function runAppServerTurn(cwd, options = {}) {
           threadId,
           input: buildTurnInput(prompt),
           model: options.model ?? null,
+          ...(options.serviceTier == null ? {} : { serviceTier: options.serviceTier }),
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
@@ -1156,7 +1190,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
       commandExecutions: turnState.commandExecutions
     };
-  });
+  }, { controlFallback: true });
 }
 
 export async function findLatestTaskThread(cwd) {

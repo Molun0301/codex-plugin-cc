@@ -106,23 +106,36 @@ function formatCodexResumeCommand(job) {
   return `codex resume ${job.threadId}`;
 }
 
+function formatServiceTier(job) {
+  const tier = job.serviceTier === "priority" ? "fast" : job.serviceTier;
+  if (!tier) {
+    return "继承默认（未确认）";
+  }
+  const suffix = job.speedUpdate?.activeTurn === "failed" ? "（当前轮次更新失败）" : "（设置值）";
+  return `${tier}${suffix}`;
+}
+
 function appendActiveJobsTable(lines, jobs) {
   lines.push("Active jobs:");
-  lines.push("| Job | Kind | Status | Phase | Elapsed | Codex Session ID | Summary | Actions |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+  lines.push("| Job | Kind | Status | Phase | 服务档位 | Elapsed | Codex Session ID | Summary | Actions |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const job of jobs) {
     const actions = [`/codex:status ${job.id}`];
     if (job.status === "queued" || job.status === "running") {
       actions.push(`/codex:cancel ${job.id}`);
     }
     lines.push(
-      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
+      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(formatServiceTier(job))} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
     );
   }
 }
 
 function pushJobDetails(lines, job, options = {}) {
   lines.push(`- ${formatJobLine(job)}`);
+  lines.push(`  服务档位: ${formatServiceTier(job)}`);
+  if (job.speedUpdate) {
+    lines.push(`  档位更新: 后续轮次=${job.speedUpdate.futureTurns}；当前轮次=${job.speedUpdate.activeTurn}`);
+  }
   if (job.summary) {
     lines.push(`  Summary: ${job.summary}`);
   }

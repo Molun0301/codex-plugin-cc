@@ -32,7 +32,8 @@ Command selection:
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
 - `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
-- `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
+- `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `ultra`.
+- 用户明确要求 `gpt-6.1-sol` 的 `ultra` 强度时，调用 `task --model gpt-6.1-sol --effort ultra`，保持参数原样传递，不降级，也不改用直接执行 `codex exec`。
 - `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
 
 Safety rules:
@@ -41,3 +42,9 @@ Safety rules:
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
 - Return the stdout of the `task` command exactly as-is.
 - If the Bash call fails or Codex cannot be invoked, return nothing.
+
+快速模式转发：
+
+- 用户指定 `--fast` 或 `--service-tier <fast|default>` 时，原样传给唯一一次 `task` 调用，并从提示文本中移除。
+- 用户要求开启快速模式时传 `--fast`；恢复标准模式时传 `--service-tier default`；未指定时省略速度参数。
+- 保留用户所选模型和思考强度；fast 是服务档位，不是模型名。

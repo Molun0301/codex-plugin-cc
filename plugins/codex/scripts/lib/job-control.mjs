@@ -278,6 +278,26 @@ export function resolveResultJob(cwd, reference) {
   throw new Error("No finished Codex jobs found for this repository yet.");
 }
 
+export function resolveSpeedJob(cwd, reference) {
+  if (!reference) {
+    throw new Error("Pass a job id to /codex:speed. Run /codex:status to list jobs.");
+  }
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const job = matchJobReference(jobs, reference);
+  if (!job || job.jobClass !== "task") {
+    throw new Error("Speed changes require a persistent rescue task job.");
+  }
+  if (job.status === "queued" || !job.threadId || (job.status === "running" && !job.turnId)) {
+    throw new Error(`Job ${job.id} is still starting. Wait for its turn id in /codex:status.`);
+  }
+  const active = jobs.find((candidate) => candidate.id !== job.id && candidate.threadId === job.threadId && candidate.status === "running");
+  if (active) {
+    throw new Error(`This conversation is running as ${active.id}. Change that job's speed instead.`);
+  }
+  return { workspaceRoot, job };
+}
+
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));

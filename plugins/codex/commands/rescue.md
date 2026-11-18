@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|ultra>] [--fast|--service-tier <fast|default>] [what Codex should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -43,7 +43,15 @@ Operating rules:
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
 - Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
+- 用户明确要求 `gpt-6.1-sol` 的 `ultra` 强度时，转发 `--model gpt-6.1-sol --effort ultra`，通过本插件派发，不降为 `xhigh`，也不改用直接执行 `codex exec`。
 - Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
 - If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/codex:setup`.
 - If the user did not supply a request, ask what Codex should investigate or fix.
+
+快速模式参数：
+
+- 将 `--fast` 和 `--service-tier <fast|default>` 原样转发给 `task`，从自然语言任务文本中移除这些控制参数。
+- 用户只说开启快速模式时，使用 `--fast`；恢复标准速度时，使用 `--service-tier default`。快速模式与模型、思考强度独立；不要把 fast 当成模型名称，也不要为提速自行降低思考强度。
+- 未指定速度时省略这两个参数，继承 Codex 配置或原对话设置。
+- 调整已经派遣的任务使用 `/codex:speed <任务编号> <fast|default>`。

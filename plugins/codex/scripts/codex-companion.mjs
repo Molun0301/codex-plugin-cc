@@ -7,6 +7,8 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { normalizeServiceTier, resolveServiceTier } from "./lib/service-tier.mjs";
+import { updateJobServiceTier, withJobSpeedLock } from "./lib/speed-control.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -32,6 +34,7 @@ import {
   listJobs,
   setConfig,
   upsertJob,
+  writeJobSpeed,
   writeJobFile
 } from "./lib/state.mjs";
 import {
@@ -40,6 +43,7 @@ import {
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
+  resolveSpeedJob,
   sortJobsNewestFirst
 } from "./lib/job-control.mjs";
 import {
@@ -68,7 +72,7 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
-const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "ultra"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
@@ -79,7 +83,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|ultra>] [--fast|--service-tier <fast|default>] [prompt]",
+      "  node scripts/codex-companion.mjs speed <job-id> <fast|default> [--json]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -121,7 +126,7 @@ function normalizeReasoningEffort(effort) {
   }
   if (!VALID_REASONING_EFFORTS.has(normalized)) {
     throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh.`
+      `Unsupported reasoning effort "${effort}". Use one of: ${[...VALID_REASONING_EFFORTS].join(", ")}.`
     );
   }
   return normalized;
@@ -345,7 +350,10 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
 
   const trackedTask = findLatestResumableTaskJob(visibleJobs);
   if (trackedTask) {
-    return { id: trackedTask.threadId };
+    const latestSpeed = jobs
+      .filter((job) => job.threadId === trackedTask.threadId && job.speedUpdate?.futureTurns === "applied")
+      .sort((left, right) => right.speedUpdate.updatedAt.localeCompare(left.speedUpdate.updatedAt))[0];
+    return { id: trackedTask.threadId, serviceTierOverride: latestSpeed?.speedUpdate.serviceTier ?? null };
   }
 
   if (sessionId) {
@@ -468,6 +476,7 @@ async function executeTaskRun(request) {
   });
 
   let resumeThreadId = null;
+  let serviceTier = request.serviceTier ?? null;
   if (request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
       excludeJobId: request.jobId
@@ -476,6 +485,7 @@ async function executeTaskRun(request) {
       throw new Error("No previous Codex task thread was found for this repository.");
     }
     resumeThreadId = latestThread.id;
+    serviceTier ??= latestThread.serviceTierOverride;
   }
 
   if (!request.prompt && !resumeThreadId) {
@@ -488,7 +498,9 @@ async function executeTaskRun(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
+    serviceTier,
+    // 沿用本机安装副本的写入策略：此主机的 AppArmor 限制导致 workspace-write 无法启动。
+    sandbox: request.write ? "danger-full-access" : "read-only",
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -589,8 +601,8 @@ function createTrackedProgress(job, options = {}) {
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
-  return createCompanionJob({
+function buildTaskJob(workspaceRoot, taskMetadata, write, serviceTier = null) {
+  return { ...createCompanionJob({
     prefix: "task",
     kind: "task",
     title: taskMetadata.title,
@@ -598,14 +610,15 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     jobClass: "task",
     summary: taskMetadata.summary,
     write
-  });
+  }), serviceTier };
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, serviceTier, prompt, write, resumeLast, jobId }) {
   return {
     cwd,
     model,
     effort,
+    serviceTier,
     prompt,
     write,
     resumeLast,
@@ -761,8 +774,8 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    valueOptions: ["model", "effort", "service-tier", "cwd", "prompt-file"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "fast"],
     aliasMap: {
       m: "model"
     }
@@ -772,6 +785,7 @@ async function handleTask(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
+  const serviceTier = resolveServiceTier(options);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
@@ -789,11 +803,12 @@ async function handleTask(argv) {
     ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, resumeLast);
 
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+    const job = buildTaskJob(workspaceRoot, taskMetadata, write, serviceTier);
     const request = buildTaskRequest({
       cwd,
       model,
       effort,
+      serviceTier,
       prompt,
       write,
       resumeLast,
@@ -804,7 +819,7 @@ async function handleTask(argv) {
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, serviceTier);
   await runForegroundCommand(
     job,
     (progress) =>
@@ -812,6 +827,7 @@ async function handleTask(argv) {
         cwd,
         model,
         effort,
+        serviceTier,
         prompt,
         write,
         resumeLast,
@@ -820,6 +836,40 @@ async function handleTask(argv) {
       }),
     { json: options.json }
   );
+}
+
+async function handleSpeed(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+  if (positionals.length !== 2) {
+    throw new Error("Usage: /codex:speed <job-id> <fast|default>");
+  }
+  const serviceTier = normalizeServiceTier(positionals[1]);
+  const cwd = resolveCommandCwd(options);
+  const { workspaceRoot, job } = resolveSpeedJob(cwd, positionals[0]);
+  const update = await withJobSpeedLock(workspaceRoot, job, async () => {
+    const accepted = await updateJobServiceTier(workspaceRoot, job, serviceTier);
+    writeJobSpeed(workspaceRoot, job.id, accepted);
+    return accepted;
+  });
+  appendLogLine(job.logFile, `Service tier ${serviceTier}: futureTurns=${update.futureTurns}, activeTurn=${update.activeTurn}.`);
+  const payload = { jobId: job.id, threadId: job.threadId, ...update };
+  const lines = [
+    `任务 ${job.id}：后续对话服务档位已设置为 ${serviceTier}。`,
+    update.activeTurn === "applied"
+      ? "当前轮次已接受设置；已发出的请求和已有子会话不保证同步变化。"
+      : update.activeTurn === "notRunning"
+        ? "任务未在运行，设置用于后续轮次。"
+        : update.activeTurn === "targetUnavailable"
+          ? "当前轮次已结束或不可更新；后续对话设置已保留。"
+          : `当前轮次更新失败，后续对话设置已保留：${update.error}`
+  ];
+  outputCommandResult(payload, `${lines.join("\n")}\n`, options.json);
+  if (update.activeTurn === "failed") {
+    process.exitCode = 1;
+  }
 }
 
 async function handleTransfer(argv) {
@@ -973,7 +1023,7 @@ async function handleCancel(argv) {
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId, runtimeEndpoint: existing.runtimeEndpoint ?? job.runtimeEndpoint });
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
@@ -1045,6 +1095,9 @@ async function main() {
       break;
     case "transfer":
       await handleTransfer(argv);
+      break;
+    case "speed":
+      await handleSpeed(argv);
       break;
     case "task-worker":
       await handleTaskWorker(argv);

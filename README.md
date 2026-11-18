@@ -11,7 +11,7 @@ they already have.
 
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, `/codex:speed`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
 
 ## Requirements
 
@@ -146,6 +146,7 @@ Examples:
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
 /codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
+/codex:rescue --background --model gpt-6.1-sol --effort ultra 检查并修复指定问题
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
 ```
@@ -159,6 +160,7 @@ Ask Codex to redesign the database connection to be more resilient.
 **Notes:**
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
+- 本机修订支持 `--effort ultra`，可通过插件派发 `gpt-6.1-sol` 的 ultra 强度任务。
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
 
@@ -318,3 +320,20 @@ Yes. If you already use Codex, the plugin picks up the same [configuration](#com
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
 
 If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
+
+### 快速模式
+
+```text
+/codex:rescue --fresh --fast 检查当前问题
+/codex:rescue --resume --fast 继续任务
+/codex:rescue --resume --service-tier default 继续任务
+/codex:speed <任务编号> fast
+/codex:speed <任务编号> default
+/codex:status <任务编号>
+```
+
+`--fast` 等价于 `--service-tier fast`，与 `--model`（模型）和 `--effort`（思考强度）独立。未指定时继承 Codex 配置或原对话。快速模式可能增加额度消耗，实际可用性由账号、模型和服务端决定；不支持时会明确报错。
+
+`/codex:speed` 要求已有持久化的 rescue 任务编号，支持运行中或已经结束的任务。运行中会分别更新后续对话与当前轮次，不创建新轮次。部分成功会单独说明，状态展示的是服务端接受的设置，不代表实际计费档位或已发出请求立刻提速。已有子会话不自动同步。
+
+本机修订的运行中切换需要 Codex CLI 0.163.0 提供的实验设置接口；插件通过自身服务启动参数启用 `step_model_switching`，无需改全局配置。旧版共享服务可能拒绝新接口；应等其任务结束后执行 `/reload-plugins`，并重新进入 Claude 会话。插件不会为了更新而中断正在执行的任务。

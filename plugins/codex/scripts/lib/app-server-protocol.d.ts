@@ -21,11 +21,15 @@ import type {
   ThreadSetNameResponse,
   ThreadStartParams as RawThreadStartParams,
   ThreadStartResponse,
+  ThreadSettingsUpdateParams,
+  ThreadSettingsUpdateResponse,
   Turn,
   TurnInterruptParams,
   TurnInterruptResponse,
   TurnStartParams,
   TurnStartResponse,
+  TurnSettingsUpdateParams,
+  TurnSettingsUpdateResponse,
   UserInput
 } from "../../.generated/app-server-types/v2/index.js";
 
@@ -54,6 +58,7 @@ export interface CodexAppServerClientOptions {
   brokerEndpoint?: string;
   disableBroker?: boolean;
   reuseExistingBroker?: boolean;
+  requestTimeoutMs?: number;
 }
 
 export interface AppServerMethodMap {
@@ -66,6 +71,8 @@ export interface AppServerMethodMap {
   "review/start": { params: ReviewStartParams; result: ReviewStartResponse };
   "turn/start": { params: TurnStartParams; result: TurnStartResponse };
   "turn/interrupt": { params: TurnInterruptParams; result: TurnInterruptResponse };
+  "thread/settings/update": { params: ThreadSettingsUpdateParams; result: ThreadSettingsUpdateResponse };
+  "turn/settings/update": { params: TurnSettingsUpdateParams; result: TurnSettingsUpdateResponse };
 }
 
 export type AppServerMethod = keyof AppServerMethodMap;
